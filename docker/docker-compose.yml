@@ -1,0 +1,103 @@
+services:
+
+  chirpstack-concentratord:
+
+    container_name: chirpstack-concentratord
+    image: xoseperez/chirpstack-concentratord
+    restart: unless-stopped
+
+    # Access to the concentrator, instead of running privileged
+    devices:
+      - /dev/ttyACM0        # USB concentrators
+    #  - /dev/spidev0.0     # SPI concentrators
+    #  - /dev/gpiochip0     # reset and power-enable GPIOs
+    group_add:
+      - "dialout"           # USB concentrators
+    #  - ${PGID_SPI:-999}   # SPI concentrators
+    #  - ${PGID_GPIO:-997}  # GPIOs
+
+    # IPC sockets shared with chirpstack-gateway-mesh
+    volumes:
+      - ipcfolder:/tmp
+
+    environment:
+      MODEL: "RAK7271"
+      INTERFACE: "USB"
+      #RESET_GPIO: 17
+      #POWER_EN_GPIO: 0
+      #HAS_GPS: 0
+      #REGION: "EU868"
+      #CHANNELS: "US915_0"
+      #DEBUG: "INFO"
+      #SOCKET_NAME: "concentratord"
+
+  chirpstack-gateway-mesh:
+
+    container_name: chirpstack-gateway-mesh
+    image: xoseperez/chirpstack-gateway-mesh
+    restart: unless-stopped
+
+    depends_on:
+      - chirpstack-concentratord
+
+    # IPC sockets shared with chirpstack-concentratord
+    volumes:
+      - ipcfolder:/tmp
+
+    environment:
+
+      # Log level (TRACE, DEBUG, INFO, WARN, ERROR). Defaults to INFO.
+      LOGGING_LEVEL: "INFO"
+
+      # Mesh root key (32 hex characters), the same on every gateway of the mesh.
+      # Generate one with: openssl rand -hex 16
+      RELAY_ROOT_KEY: "00000000000000000000000000000000"
+
+      # Set to "true" if this is a border gateway. Defaults to "false".
+      #RELAY_BORDER: "false"
+
+      # For border gateways, set to "true" to ignore direct uplinks (only relayed messages will be processed). Defaults to "false".
+      #RELAY_IGNORE_DIRECT: "false"
+
+      # For relay gateways, how often to send a heartbeat. Defaults to 5m.
+      #RELAY_HEARTBEAT_INTERVAL: "5m"
+
+      # Region of the end-devices (as923, as923_2, as923_3, as923_4, au915, eu868, in865, ism2400, kr920, ru864, us915). Defaults to eu868.
+      RELAY_REGION_DEVICES: "eu868"
+
+      # Band of the link between gateways (eu868, us915, ism2400), sets the default frequencies and TX power. Defaults to eu868.
+      RELAY_REGION_RELAY: "eu868"
+
+      # Frequencies for the link between gateways. Required for bands other than the three above.
+      #RELAY_FREQUENCIES: 868100000,868300000,868500000
+
+      # TX power for the link between gateways. Defaults to 10dBm for ISM2400, 16dBm otherwise.
+      #RELAY_TX_POWER: 16
+
+      # Modulation for the link between gateways. Possible values: LORA, FSK. Defaults to LORA.
+      #RELAY_MODULATION: LORA
+
+      # Spreading factor for the link between gateways. Applies only to LORA modulation. Defaults to 7.
+      #RELAY_SF: 7
+
+      # Bandwidth in Hz for the link between gateways. Applies only to LORA modulation. Defaults to 125000 (125 kHz).
+      #RELAY_BANDWIDTH: 125000
+
+      # Code-rate for the link between gateways. Applies only to LORA modulation. Defaults to 4/5.
+      #RELAY_CODERATE: "4/5"
+
+      # Bitrate for the link between gateways. Applies only to FSK modulation. Defaults to 0.
+      #RELAY_FSK_BITRATE: 0
+
+      # Socket name of the concentratord service talking to end-devices.
+      #RELAY_SOCKET_DEVICES: "concentratord"
+
+      # Socket name of the concentratord service talking to other gateways.
+      # It must support the band above. Can be the same as RELAY_SOCKET_DEVICES.
+      #RELAY_SOCKET_RELAY: "concentratord"
+
+      # For border gateways, socket name offered to the chirpstack-mqtt-forwarder service.
+      #RELAY_SOCKET_FORWARDER: "forwarder"
+
+volumes:
+  ipcfolder:

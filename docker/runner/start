@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+
+# Entry point of the ChirpStack Gateway Mesh image: builds the configuration
+# from environment variables, then starts the mesh service.
+#
+#   bash start            start the service
+#   bash start --render   print the configuration and exit
+
+source ./common.sh
+
+# Default mesh frequencies for the bands the relay link can use.
+declare -A FREQUENCIES=(
+    [eu868]="868100000,868300000,868500000"
+    [us915]="902300000,902500000,902700000"
+    [ism2400]="2403000000,2479000000,2425000000"
+)
+
+# An all-zero key means "not set" to the mesh service.
+NULL_KEY="00000000000000000000000000000000"
+
+# -----------------------------------------------------------------------------
+# Defaults
+# -----------------------------------------------------------------------------
+
+env_alias RELAY_REGION_RELAY RELAY_REGION
+
+LOGGING_LEVEL=${LOGGING_LEVEL:-"INFO"}
+LOGGING_LEVEL=${LOGGING_LEVEL^^}
+
+RELAY_ROOT_KEY=${RELAY_ROOT_KEY:-${NULL_KEY}}
+RELAY_SIGNING_KEY=${RELAY_SIGNING_KEY:-${NULL_KEY}}
+RELAY_ID=${RELAY_ID:-""}
+
+RELAY_BORDER=${RELAY_BORDER:-"false"}
+RELAY_BORDER=${RELAY_BORDER,,}
+# Ignoring direct uplinks only applies to a border gateway.
+if [[ "${RELAY_BORDER}" == "true" ]]; then
+    RELAY_IGNORE_DIRECT=${RELAY_IGNORE_DIRECT:-"false"}
+    RELAY_IGNORE_DIRECT=${RELAY_IGNORE_DIRECT,,}
+else
+    RELAY_IGNORE_DIRECT="false"
+fi
+RELAY_MAX_HOP_COUNT=${RELAY_MAX_HOP_COUNT:-1}
+RELAY_HEARTBEAT_INTERVAL=${RELAY_HEARTBEAT_INTERVAL:-"5m"}
+
+RELAY_REGION_DEVICES=${RELAY_REGION_DEVICES:-"eu868"}
+RELAY_REGION_DEVICES=${RELAY_REGION_DEVICES,,}
+RELAY_REGION_RELAY=${RELAY_REGION_RELAY:-"eu868"}
+RELAY_REGION_RELAY=${RELAY_REGION_RELAY,,}
+RELAY_FREQUENCIES=${RELAY_FREQUENCIES:-${FREQUENCIES[${RELAY_REGION_RELAY}]:-}}
+RELAY_FREQUENCIES=${RELAY_FREQUENCIES// /}
+if [[ "${RELAY_REGION_RELAY}" == "ism2400" ]]; then
+    RELAY_TX_POWER=${RELAY_TX_POWER:-10}
+else
+    RELAY_TX_POWER=${RELAY_TX_POWER:-16}
+fi
+RELAY_MODULATION=${RELAY_MODULATION:-"LORA"}
+RELAY_MODULATION=${RELAY_MODULATION^^}
+RELAY_SF=${RELAY_SF:-7}
+RELAY_BANDWIDTH=${RELAY_BANDWIDTH:-125000}
+RELAY_CODERATE=${RELAY_CODERATE:-"4/5"}
+RELAY_FSK_BITRATE=${RELAY_FSK_BITRATE:-0}
+
+RELAY_SOCKET_DEVICES=${RELAY_SOCKET_DEVICES:-"concentratord"}
+RELAY_SOCKET_RELAY=${RELAY_SOCKET_RELAY:-"concentratord"}
+RELAY_SOCKET_FORWARDER=${RELAY_SOCKET_FORWARDER:-"forwarder"}
+
+REGION_FILE=./regions/region_${RELAY_REGION_DEVICES}.toml
+
+# -----------------------------------------------------------------------------
+# Checks
+# -----------------------------------------------------------------------------
+
+# The service has no OFF level: it refuses to start with one.
+if [[ ! "${LOGGING_LEVEL}" =~ ^(TRACE|DEBUG|INFO|WARN|ERROR)$ ]]; then
+    fail "LOGGING_LEVEL must be one of TRACE, DEBUG, INFO, WARN or ERROR (got '${LOGGING_LEVEL}')"
+fi
+for VAR in RELAY_ROOT_KEY RELAY_SIGNING_KEY; do
+    if [[ ! "${!VAR}" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        fail "${VAR} must be 32 hexadecimal characters (a 128-bit key)"
+    fi
+done
+if [[ -n "${RELAY_ID}" && ! "${RELAY_ID}" =~ ^[0-9a-fA-F]{8}$ ]]; then
+    fail "RELAY_ID must be 8 hexadecimal characters, or empty to derive it from the gateway ID (got '${RELAY_ID}')"
+fi
+for VAR in RELAY_BORDER RELAY_IGNORE_DIRECT; do
+    if [[ ! "${!VAR}" =~ ^(true|false)$ ]]; then
+        fail "${VAR} must be true or false (got '${!VAR}')"
+    fi
+done
+for VAR in RELAY_MAX_HOP_COUNT RELAY_SF RELAY_BANDWIDTH RELAY_FSK_BITRATE; do
+    if [[ ! "${!VAR}" =~ ^[0-9]+$ ]]; then
+        fail "${VAR} must be a number (got '${!VAR}')"
+    fi
+done
+if [[ ! "${RELAY_TX_POWER}" =~ ^-?[0-9]+$ ]]; then
+    fail "RELAY_TX_POWER must be a number of dBm (got '${RELAY_TX_POWER}')"
+fi
+if [[ ! "${RELAY_MODULATION}" =~ ^(LORA|FSK)$ ]]; then
+    fail "RELAY_MODULATION must be LORA or FSK (got '${RELAY_MODULATION}')"
+fi
+if [[ -z "${RELAY_FREQUENCIES}" ]]; then
+    fail "There are no default frequencies for RELAY_REGION_RELAY '${RELAY_REGION_RELAY}' (only for ${!FREQUENCIES[*]}): set RELAY_FREQUENCIES"
+fi
+if [[ ! "${RELAY_FREQUENCIES}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    fail "RELAY_FREQUENCIES must be a comma-separated list of frequencies in Hz (got '${RELAY_FREQUENCIES}')"
+fi
+if [[ ! -f "${REGION_FILE}" ]]; then
+    REGIONS=""
+    for FILE in regions/region_*.toml; do
+        FILE=${FILE#regions/region_}
+        REGIONS+="${FILE%.toml} "
+    done
+    fail "Unknown RELAY_REGION_DEVICES '${RELAY_REGION_DEVICES}'. Valid values: ${REGIONS}"
+fi
+
+# Every gateway of a mesh must use the same keys, so changing them means
+# changing all gateways at once.
+if [[ "${RELAY_ROOT_KEY}" == "${NULL_KEY}" && "${RELAY_SIGNING_KEY}" == "${NULL_KEY}" ]]; then
+    warn "RELAY_ROOT_KEY is not set: mesh packets are signed and encrypted with keys anyone can derive." \
+        "Set the same RELAY_ROOT_KEY on every gateway of the mesh."
+elif [[ "${RELAY_SIGNING_KEY}" != "${NULL_KEY}" ]]; then
+    warn "RELAY_SIGNING_KEY is deprecated. It still signs mesh packets, but event and command payloads" \
+        "are encrypted with a key derived from RELAY_ROOT_KEY."
+    if [[ "${RELAY_ROOT_KEY}" == "${NULL_KEY}" ]]; then
+        warn "RELAY_ROOT_KEY is not set, so anyone can derive that encryption key."
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+CONFIG_FILE=./run/config.toml
+
+render chirpstack-gateway-mesh.toml.template "${CONFIG_FILE}" \
+    LOGGING_LEVEL \
+    RELAY_ROOT_KEY RELAY_SIGNING_KEY RELAY_ID RELAY_BORDER RELAY_MAX_HOP_COUNT \
+    RELAY_IGNORE_DIRECT RELAY_FREQUENCIES RELAY_TX_POWER \
+    RELAY_MODULATION RELAY_SF RELAY_BANDWIDTH RELAY_CODERATE RELAY_FSK_BITRATE \
+    RELAY_SOCKET_FORWARDER RELAY_SOCKET_DEVICES RELAY_SOCKET_RELAY \
+    RELAY_HEARTBEAT_INTERVAL
+
+# The service reads both files as one, in this order.
+if [[ "${1:-}" == "--render" ]]; then
+    cat "${CONFIG_FILE}" "${REGION_FILE}"
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Info
+# -----------------------------------------------------------------------------
+
+key_state() { [[ "$1" == "${NULL_KEY}" ]] && echo "not set" || echo "set"; }
+
+echo
+info "------------------------------------------------------------------"
+info "$( ./chirpstack-gateway-mesh -V )"
+info "LoRa(WAN) Gateway Mesh Service"
+info "------------------------------------------------------------------"
+info "Logging level:             ${LOGGING_LEVEL}"
+info "Border gateway:            ${RELAY_BORDER}"
+info "Root key:                  $(key_state "${RELAY_ROOT_KEY}")"
+if [[ "${RELAY_SIGNING_KEY}" != "${NULL_KEY}" ]]; then
+    info "Signing key:               set (deprecated)"
+fi
+if [[ -n "${RELAY_ID}" ]]; then
+    info "Relay ID:                  ${RELAY_ID}"
+fi
+info "Max hop count:             ${RELAY_MAX_HOP_COUNT}"
+if [[ "${RELAY_BORDER}" == "true" ]]; then
+    info "Ignore direct messages:    ${RELAY_IGNORE_DIRECT}"
+else
+    info "Heartbeat interval:        ${RELAY_HEARTBEAT_INTERVAL}"
+fi
+info "Relaying for:              ${RELAY_REGION_DEVICES}"
+info "Relay band:                ${RELAY_REGION_RELAY}"
+info "Relay frequencies:         ${RELAY_FREQUENCIES}"
+info "Relay TX power:            ${RELAY_TX_POWER}"
+info "Relay modulation:          ${RELAY_MODULATION}"
+if [[ "${RELAY_MODULATION}" == "LORA" ]]; then
+    info "Relay spreading factor:    ${RELAY_SF}"
+    info "Relay bandwidth:           ${RELAY_BANDWIDTH}"
+    info "Relay code-rate:           ${RELAY_CODERATE}"
+else
+    info "Relay bitrate:             ${RELAY_FSK_BITRATE}"
+fi
+info "End-device socket name:    ${RELAY_SOCKET_DEVICES}"
+info "Relay socket name:         ${RELAY_SOCKET_RELAY}"
+if [[ "${RELAY_BORDER}" == "true" ]]; then
+    info "Forwarder socket name:     ${RELAY_SOCKET_FORWARDER}"
+fi
+info "------------------------------------------------------------------"
+info "Resources: https://www.chirpstack.io/docs/chirpstack-gateway-mesh"
+info "           https://github.com/chirpstack/chirpstack-gateway-mesh"
+info "------------------------------------------------------------------"
+echo
+
+# -----------------------------------------------------------------------------
+# Start
+# -----------------------------------------------------------------------------
+
+# A border gateway serves the forwarder through its own sockets. Remove any left
+# over from a previous run, so the forwarder doesn't pick those up instead.
+if [[ "${RELAY_BORDER}" == "true" ]]; then
+    rm -f "/tmp/${RELAY_SOCKET_FORWARDER}_event" "/tmp/${RELAY_SOCKET_FORWARDER}_command"
+fi
+
+wait_for_sockets "${RELAY_SOCKET_DEVICES}" "${RELAY_SOCKET_RELAY}"
+
+exec ./chirpstack-gateway-mesh -c "${CONFIG_FILE}" -c "${REGION_FILE}"

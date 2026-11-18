@@ -1,0 +1,51 @@
+services:
+
+  # This is a subGHz link to both end-devices and relay gateways
+  chirpstack-concentratord-slot1:
+
+    container_name: chirpstack-concentratord-slot1
+    image: xoseperez/chirpstack-concentratord
+    restart: unless-stopped
+    devices:
+      - /dev/ttyACM0
+    #  - /dev/spidev0.0
+    #  - /dev/gpiochip0
+    volumes:
+      - ipcfolder:/tmp
+    environment:
+      DEBUG: "INFO"
+      MODEL: "RAK7271"
+      INTERFACE: "USB"
+      REGION: "eu868"
+      SOCKET_NAME: "slot1"
+    group_add:
+      - dialout
+    #  - ${PGID_GPIO:-993}
+    #  - ${PGID_I2C:-994}
+    #  - ${PGID_SPI:-995}
+
+  # The gateway-mesh service relays messages from end devices
+  # to other gateways using the same concentrator
+  chirpstack-gateway-mesh:
+
+    container_name: chirpstack-gateway-mesh
+    image: xoseperez/chirpstack-gateway-mesh
+    restart: unless-stopped
+    depends_on:
+      - chirpstack-concentratord-slot1
+    volumes:
+      - ipcfolder:/tmp
+    environment:
+      LOGGING_LEVEL: "INFO"
+      RELAY_BORDER: "false"
+      RELAY_ROOT_KEY: "00000000000000000000000000000000" # use your own, the same on every gateway
+      RELAY_MAX_HOP_COUNT: 1
+      #RELAY_HEARTBEAT_INTERVAL: "5m"
+      RELAY_REGION_DEVICES: "eu868"
+      RELAY_REGION_RELAY: "eu868"
+      RELAY_TX_POWER: 16
+      RELAY_SOCKET_DEVICES: "slot1"
+      RELAY_SOCKET_RELAY: "slot1"
+
+volumes:
+  ipcfolder:

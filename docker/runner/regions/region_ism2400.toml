@@ -1,0 +1,2 @@
+# Upstream ships no region file for ISM2400, so there are no channel or
+# data-rate mappings for end-devices in this band.

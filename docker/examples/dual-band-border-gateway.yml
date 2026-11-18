@@ -1,0 +1,116 @@
+services:
+
+  # This is the subGHz link to end-devices
+  chirpstack-concentratord-slot1:
+
+    container_name: chirpstack-concentratord-slot1
+    image: xoseperez/chirpstack-concentratord
+    restart: unless-stopped
+    devices:
+      - /dev/spidev0.0
+      - /dev/gpiochip0
+    volumes:
+      - ipcfolder:/tmp
+    environment:
+      DEBUG: "INFO"
+      MODEL: "RAK2287"
+      INTERFACE: "SPI"
+      RESET_GPIO: 17
+      REGION: "eu868"
+      SOCKET_NAME: "slot1"
+    group_add:
+      - ${PGID_GPIO:-993}
+      - ${PGID_I2C:-994}
+      - ${PGID_SPI:-995}
+
+  # This is the 2.4 GHz link between gateways
+  # Note: it can also be a second subGHz concentrator!
+  chirpstack-concentratord-slot2:
+
+    container_name: chirpstack-concentratord-slot2
+    image: xoseperez/chirpstack-concentratord
+    restart: unless-stopped
+    devices:
+      - /dev/ttyACM0
+    volumes:
+      - ipcfolder:/tmp
+    environment:
+      DEBUG: "INFO"
+      MODEL: "RAK5148"
+      INTERFACE: "USB"
+      REGION: "ism2400"
+      SOCKET_NAME: "slot2"
+    group_add:
+      - dialout
+
+  # The gateway-mesh service handles both concentratord instances
+  # and exposes the original messages to the mqtt-forwarder service
+  # on the ipc:///tmp/forwarder_[event|command] sockets
+  chirpstack-gateway-mesh:
+
+    container_name: chirpstack-gateway-mesh
+    image: xoseperez/chirpstack-gateway-mesh
+    restart: unless-stopped
+    depends_on:
+      - chirpstack-concentratord-slot1
+      - chirpstack-concentratord-slot2
+    volumes:
+      - ipcfolder:/tmp
+    environment:
+      LOGGING_LEVEL: "INFO"
+      RELAY_BORDER: "true"
+      RELAY_ROOT_KEY: "00000000000000000000000000000000" # use your own, the same on every gateway
+      RELAY_MAX_HOP_COUNT: 1
+      RELAY_IGNORE_DIRECT: "true" # for testing: allow only relayed messages
+      RELAY_REGION_DEVICES: "eu868" # if using a EU868 concentrator on slot 1
+      RELAY_REGION_RELAY: "ism2400" # if using a 2.4GHz concentrator on slot 2
+      # The 2.4GHz concentrators listen at SF12 and 812kHz: relay with the same settings
+      RELAY_MODULATION: LORA
+      RELAY_SF: 12
+      RELAY_BANDWIDTH: 812000
+      RELAY_CODERATE: "4/5"
+      RELAY_TX_POWER: 10 # max power for 2.4GHz is 10dBm (up to 16 for subGHz)
+      RELAY_SOCKET_DEVICES: "slot1"
+      RELAY_SOCKET_RELAY: "slot2"
+      RELAY_SOCKET_FORWARDER: "forwarder"
+
+  # Sample mosquitto broker
+  # Use this one for testing purposes (set MQTT_JSON to true on the mqtt-forwarder service for debug)
+  mosquitto:
+    image: eclipse-mosquitto
+    container_name: mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+
+  # Forwards messages to an MQTT broker
+  # You can use the included mosquitto service or connect it
+  # directly to a ChirpStack LNS for full LoRaWAN support
+  chirpstack-mqtt-forwarder:
+
+    container_name: chirpstack-mqtt-forwarder
+    image: xoseperez/chirpstack-mqtt-forwarder
+    restart: unless-stopped
+    depends_on:
+      - chirpstack-gateway-mesh
+      - mosquitto
+    volumes:
+      - ipcfolder:/tmp
+    environment:
+      LOGGING_LEVEL: "INFO"
+      MQTT_TOPIC_PREFIX: "eu868"
+      MQTT_SERVER: "tcp://mosquitto:1883" # for testing: send messages to local mosquitto instance
+      MQTT_JSON: "true" # for testing: send messages in plain text
+      #MQTT_USERNAME: ""
+      #MQTT_PASSWORD: ""
+      #MQTT_QOS: 0
+      #MQTT_CA_CERT_PATH: ""
+      #MQTT_CLIENT_CERT_PATH: ""
+      #MQTT_CLIENT_KEY_PATH: ""
+      BACKEND: "concentratord"
+      SOCKET_NAME: "forwarder"
+
+volumes:
+  ipcfolder:
